@@ -427,6 +427,68 @@
   AHCで最大候補数を厳密に見積もれる場合のみ使用してください。
 
   ============================================================
+  ビーム幅の自動調整（任意）
+  ============================================================
+
+  入力によって1ターンにかかる時間が大きく変わる問題では、ビーム幅を固定すると
+  時間が余ったり足りなくなったりします。
+  config.time_limit_ms を指定すると、beam_search() を呼んでからその時間で
+  全ターンを終えるように、ターンごとにビーム幅を決め直します。
+
+  timer.setNowTime();
+  Beam::Config config;
+  config.max_turn = T;
+  config.beam_width = 100;                                 // 最初のターンの幅（小さめでよい）
+  config.time_limit_ms = Time_Limit - timer.getNowTime();  // 残り時間をすべて使う
+  config.max_beam_width = 20000;                           // 任意。幅の上限
+
+  - 「1ターンの処理時間 ÷ 展開したノード数」から1ノードあたりの時間を推定し、
+    「残り時間 ÷ 残りターン数」で回せるだけの幅にします。
+  - 序盤は2ターン目から一気に目標の幅まで広げます。終盤は推定のずれで時間を超えないよう、
+    幅を増やすのは1ターンで2倍までにします。
+  - 時間が足りなくなると幅は min_beam_width まで下がります（ターンは最後まで進めます）。
+  - 固定容量buffer版と組み合わせる場合は、
+    max_beam_width × 最大分岐数 ≤ candidate_capacity にしてください。
+  - config.width_log に vector のアドレスを渡すと、各ターンの幅が記録されます。
+
+    std::vector<std::size_t> widths;
+    config.width_log = &widths;
+
+  ============================================================
+  重複除去（任意）
+  ============================================================
+
+  別々の手順で同じ状態にたどり着く問題（グリッド上の移動など）では、
+  ビームが同じ状態の候補で埋まり、多様性が落ちることがあります。
+  その場合は重複除去版を使い、子ノードの状態のハッシュ値を渡してください。
+  同じターン内で同じハッシュ値の候補は、最も良い1つだけが残ります。
+
+  using Beam = etbs::DedupEulerTourBeamSearch<Action, Score, StateBase>;
+
+  ハッシュ値は Zobrist hash（zobrist.cpp）を State に持たせ、
+  apply / undo で差分更新するのが基本です。
+
+  expand() では push の代わりに push_with_hash を使います。
+
+  void expand(int parent, Selector& selector) {
+    for (...) {
+      apply(action);
+      Score next_score = value;
+      std::uint64_t next_hash = hash;  // apply() で差分更新済みのハッシュ値
+      undo(action);
+
+      selector.push_with_hash(action, next_score, next_hash);
+    }
+  }
+
+  - 終了候補はこれまで通り push_finished(action, score) で追加します（重複除去の対象外）。
+  - 重複除去版では push(action, score) と push(action, score, parent, finished) は使えません
+    （コンパイルエラーになります）。
+  - 固定容量buffer版と組み合わせる場合:
+    using Beam = etbs::DedupEulerTourBeamSearch<Action, Score, StateBase, true>;
+  - 重複除去しない通常版の速度・挙動は変わりません。
+
+  ============================================================
   利用者が実装しなくてよいもの
   ============================================================
 
@@ -444,7 +506,9 @@
 */
 
 #include <algorithm>
+#include <bit>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <concepts>
 #include <cstddef>
@@ -615,7 +679,10 @@ class FixedBuffer {
   T *data_ = nullptr;
 };
 
-template <ActionConcept Action, ScoreConcept Score, template <class> class State, bool FixedCandidateBuffer = false>
+// Deduplicate=true なら、同じターン内で同じハッシュ値の候補は最良の1つだけを残す。
+// 通常は下の DedupEulerTourBeamSearch エイリアスから使う。
+template <ActionConcept Action, ScoreConcept Score, template <class> class State, bool FixedCandidateBuffer = false,
+          bool Deduplicate = false>
 class EulerTourBeamSearch {
  public:
   enum class SelectionPolicy {
@@ -665,15 +732,30 @@ class EulerTourBeamSearch {
     std::size_t lca_switch_ratio = 32;
     // LCA arenaのreserveヒント。0なら必要に応じてvectorを拡張する。
     std::size_t lca_capacity = 0;
+
+    // ---- 時間に合わせたビーム幅の自動調整（任意） ----
+    // time_limit_ms > 0 なら、beam_search() を呼んでから time_limit_ms[ms] で全ターンを終えるよう、
+    // ターンごとに処理時間を測ってビーム幅を決め直す。beam_width は最初のターンの幅として使う。
+    double time_limit_ms = 0;
+    std::size_t min_beam_width = 1;
+    std::size_t max_beam_width = std::numeric_limits<std::size_t>::max();
+    // 指定すると、各ターンのビーム幅をここに記録する（調整の様子の確認用）。
+    std::vector<std::size_t> *width_log = nullptr;
   };
+
+  struct NoHash {};
 
   struct Candidate {
     Action action;
     Score score;
     std::uint64_t tie_key;
+    // 子ノードの状態のハッシュ値。Deduplicate=false のときは領域を取らない。
+    [[no_unique_address]] std::conditional_t<Deduplicate, std::uint64_t, NoHash> hash{};
 
-    Candidate(const Action &action_, const Score &score_, int parent_, std::uint32_t order_)
+    Candidate(const Action &action_, const Score &score_, int parent_, std::uint32_t order_, std::uint64_t hash_ = 0)
         : action(action_), score(score_), tie_key((std::uint64_t(static_cast<std::uint32_t>(parent_)) << 32) | order_) {
+      if constexpr (Deduplicate)
+        hash = hash_;
     }
 
     [[nodiscard]] std::uint32_t parent() const noexcept {
@@ -754,7 +836,18 @@ class EulerTourBeamSearch {
           std::abort();
         batch_limit_ = std::min(batch_limit_, config.candidate_capacity);
       }
+      batch_factor_ = std::max<std::size_t>(config.batch_factor, 2);
       finished_candidates_.reserve(config.beam_width);
+      if constexpr (Deduplicate)
+        rebuild_hash_table(std::bit_ceil(std::max<std::size_t>(16, candidate_capacity(config) * 2)));
+    }
+
+    // ビーム幅を変える（時間に合わせた自動調整で使う）。
+    void set_beam_width(std::size_t beam_width) noexcept {
+      beam_width_ = beam_width;
+      batch_limit_ = beam_width * batch_factor_;
+      if constexpr (FixedCandidateBuffer)
+        batch_limit_ = std::min(batch_limit_, candidates_.capacity());
     }
 
     void begin_parent(int parent) noexcept {
@@ -765,11 +858,40 @@ class EulerTourBeamSearch {
 
     // 高速API: TreeがState::expand()の前にbegin_parent(parent)を呼んでいる。
     void push(const Action &action, const Score &score) {
+      static_assert(!Deduplicate, "DedupEulerTourBeamSearch では push_with_hash(action, score, hash) を使ってください");
       assert(current_parent_ != kNoParent);
       prepare_for_push();
       assert(local_order_ != std::numeric_limits<std::uint32_t>::max());
       candidates_.emplace_back(action, score, static_cast<int>(current_parent_), local_order_++);
       selected_ = false;
+      maybe_reduce_batch();
+    }
+
+    // 重複除去版の高速API。DedupEulerTourBeamSearch でのみ使える。
+    // hash は action 適用後の子ノードの状態のハッシュ値。
+    // このターンに同じ hash の候補が既にあれば、良い方だけを残す。
+    void push_with_hash(const Action &action, const Score &score, std::uint64_t hash) {
+      static_assert(Deduplicate, "push_with_hash は DedupEulerTourBeamSearch でのみ使えます");
+      assert(current_parent_ != kNoParent);
+      assert(local_order_ != std::numeric_limits<std::uint32_t>::max());
+      const Candidate candidate(action, score, static_cast<int>(current_parent_), local_order_++, hash);
+      selected_ = false;
+      std::size_t slot = find_hash_slot(hash);
+      if (hash_slots_[slot].epoch == hash_epoch_) {
+        Candidate &old = candidates_[hash_slots_[slot].index];
+        if (Better{}(candidate, old))
+          old = candidate;
+        return;
+      }
+      const std::size_t size_before = candidates_.size();
+      prepare_for_push();
+      // BatchedFloydの圧縮が起きた場合はハッシュテーブルが作り直されている。
+      if (candidates_.size() != size_before)
+        slot = find_hash_slot(hash);
+      hash_slots_[slot] = HashSlot{hash, static_cast<std::uint32_t>(candidates_.size()), hash_epoch_};
+      candidates_.emplace_back(candidate);
+      if (candidates_.size() * 2 > hash_slots_.size())
+        rebuild_hash_table(hash_slots_.size() * 2);
       maybe_reduce_batch();
     }
 
@@ -848,6 +970,8 @@ class EulerTourBeamSearch {
       current_parent_ = kNoParent;
       local_order_ = 0;
       selected_ = false;
+      if constexpr (Deduplicate)
+        next_hash_epoch();
     }
 
     void clear_finished_candidates() noexcept {
@@ -903,6 +1027,54 @@ class EulerTourBeamSearch {
       auto middle = candidates_.begin() + static_cast<std::ptrdiff_t>(beam_width_);
       FloydRivest::select(candidates_.begin(), middle, candidates_.end(), Better{});
       candidates_.resize(beam_width_);
+      // 候補の位置が変わり、一部は消えたのでハッシュテーブルを作り直す。
+      if constexpr (Deduplicate)
+        rebuild_hash_table(hash_slots_.size());
+    }
+
+    // ============================================================
+    // 重複除去用のハッシュテーブル（Deduplicate=true のときだけ使う）
+    // ============================================================
+    // open addressing。epoch が現在の hash_epoch_ と一致するスロットだけが有効で、
+    // clear() では epoch を進めるだけなのでテーブル全体の初期化は不要。
+    // 常に「candidates_ の各要素がちょうど1つのスロットに登録されている」状態を保つ。
+    struct HashSlot {
+      std::uint64_t key = 0;
+      std::uint32_t index = 0;  // candidates_ 内の位置
+      std::uint32_t epoch = 0;
+    };
+
+    // hash が登録済みならそのスロット、未登録なら登録すべき空きスロットを返す。
+    std::size_t find_hash_slot(std::uint64_t hash) const noexcept {
+      // 利用者のハッシュ値の下位ビットが偏っていても散らばるよう、乗算して上位ビットを使う。
+      std::size_t i = static_cast<std::size_t>((hash * 0x9e3779b97f4a7c15ULL) >> hash_shift_);
+      while (hash_slots_[i].epoch == hash_epoch_ && hash_slots_[i].key != hash)
+        i = (i + 1) & hash_mask_;
+      return i;
+    }
+
+    void next_hash_epoch() noexcept {
+      if (++hash_epoch_ == 0) {
+        for (HashSlot &slot : hash_slots_)
+          slot.epoch = 0;
+        hash_epoch_ = 1;
+      }
+    }
+
+    // テーブルサイズを table_size（2のべき乗）にして、candidates_ を登録し直す。
+    void rebuild_hash_table(std::size_t table_size) {
+      assert(std::has_single_bit(table_size));
+      if (table_size != hash_slots_.size()) {
+        hash_slots_.assign(table_size, HashSlot{});
+        hash_mask_ = table_size - 1;
+        hash_shift_ = 64 - std::countr_zero(table_size);
+        hash_epoch_ = 0;
+      }
+      next_hash_epoch();
+      for (std::uint32_t i = 0; i < candidates_.size(); ++i) {
+        const std::uint64_t hash = candidates_[i].hash;
+        hash_slots_[find_hash_slot(hash)] = HashSlot{hash, i, hash_epoch_};
+      }
     }
 
     void heap_select(std::size_t k) {
@@ -936,12 +1108,17 @@ class EulerTourBeamSearch {
     std::size_t beam_width_;
     SelectionPolicy selection_policy_;
     std::size_t batch_limit_;
+    std::size_t batch_factor_ = 2;
     Buffer candidates_;
     std::vector<Candidate> finished_candidates_;
     std::uint32_t current_parent_ = kNoParent;
     std::uint32_t local_order_ = 0;
     bool selected_ = false;
     bool finished_sorted_ = true;
+    std::vector<HashSlot> hash_slots_;
+    std::size_t hash_mask_ = 0;
+    int hash_shift_ = 64;
+    std::uint32_t hash_epoch_ = 1;
   };
 
  private:
@@ -1003,6 +1180,19 @@ class EulerTourBeamSearch {
         lca_next_.reserve(config.beam_width);
         lca_down_.reserve(static_cast<std::size_t>(std::max(config.max_turn, 0)) + 1);
       }
+    }
+
+    // ビーム幅が width まで増えても動くよう、葉の数に比例する作業用配列を広げる。
+    void reserve_width(std::size_t width) {
+      if (width <= counts_.size())
+        return;
+      counts_.resize(width);
+      offsets_.resize(width + 1);
+      positions_.resize(width);
+      seen_stamp_.resize(width, 0u);
+      grouped_indices_.reserve(width);
+      lca_leaves_.reserve(width);
+      lca_next_.reserve(width);
     }
 
     void dfs(Selector &selector) {
@@ -1538,6 +1728,17 @@ class EulerTourBeamSearch {
     std::optional<Score> best_finished_score;
     std::vector<Action> best_finished_path;
 
+    // 時間に合わせたビーム幅の自動調整（config.time_limit_ms > 0 のとき）
+    using Clock = std::chrono::steady_clock;
+    const auto search_start = Clock::now();
+    auto turn_start = search_start;
+    double ms_per_node = -1;   // 1ノードの展開にかかる時間の推定値[ms]
+    std::size_t expanded = 1;  // このターンに展開するノード数（最初のターンは根だけ）
+    std::size_t width = config.beam_width;
+    std::size_t max_width = std::max(config.max_beam_width, config.min_beam_width);
+    if constexpr (FixedCandidateBuffer)
+      max_width = std::min(max_width, std::max<std::size_t>(config.candidate_capacity, 2) - 1);
+
     for (int turn = 0; turn < config.max_turn; ++turn) {
       tree.dfs(selector);
 
@@ -1556,6 +1757,8 @@ class EulerTourBeamSearch {
         selector.clear_finished_candidates();
       }
 
+      if (config.width_log)
+        config.width_log->push_back(width);
       const auto &selected = selector.select();
       if (selected.empty())
         return tree.take_state_at_path(best_finished_path);
@@ -1567,12 +1770,48 @@ class EulerTourBeamSearch {
         return tree.take_state_at_path(path);
       }
 
+      const std::size_t selected_count = selected.size();
       tree.update(selected);
       selector.clear();
+
+      if (config.time_limit_ms > 0) {
+        const auto now = Clock::now();
+        const double turn_ms = std::chrono::duration<double, std::milli>(now - turn_start).count();
+        const double elapsed_ms = std::chrono::duration<double, std::milli>(now - search_start).count();
+        turn_start = now;
+        // 最初のターンは根1つの展開と初期化だけなので、推定には使わない。
+        if (turn > 0) {
+          const double sample = turn_ms / static_cast<double>(expanded);
+          ms_per_node = ms_per_node < 0 ? sample : 0.5 * ms_per_node + 0.5 * sample;
+        }
+        expanded = selected_count;
+        if (ms_per_node > 0) {
+          // 残り時間を残りターンで均等に割り、1ターンで展開できるノード数を次の幅にする。
+          // 幅を一気に広げると、キャッシュに乗らなくなるなどで1ノードの時間が推定より増えることがある。
+          // そこで2倍を超えて広げるのは「推定の4倍かかっても残り時間の半分で済む」幅までにする。
+          // 序盤はほぼ制限がかからず一気に目標の幅になり、終盤だけ慎重になる。
+          const double remaining_ms = config.time_limit_ms - elapsed_ms;
+          const double ms_per_turn = remaining_ms / (config.max_turn - turn - 1);
+          double target = ms_per_turn / ms_per_node;
+          target = std::min(target, std::max(2.0 * static_cast<double>(width), remaining_ms / (8.0 * ms_per_node)));
+          // 候補が足りずビームが埋まらなかったときは、幅を広げても意味がないので広げない。
+          if (selected_count < width)
+            target = std::min(target, static_cast<double>(width));
+          target = std::min(target, static_cast<double>(max_width));
+          target = std::max(target, static_cast<double>(config.min_beam_width));
+          width = std::max<std::size_t>(static_cast<std::size_t>(target), 1);
+          selector.set_beam_width(width);
+          tree.reserve_width(width);
+        }
+      }
     }
 
     std::abort();  // config.max_turn > 0 なら到達しない。
   }
 };
+
+// 重複除去つきビームサーチ。expand() では selector.push_with_hash(action, score, hash) を使う。
+template <ActionConcept Action, ScoreConcept Score, template <class> class State, bool FixedCandidateBuffer = false>
+using DedupEulerTourBeamSearch = EulerTourBeamSearch<Action, Score, State, FixedCandidateBuffer, true>;
 
 }  // namespace etbs
