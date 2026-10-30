@@ -44,6 +44,94 @@ inline bool chmin(T &a, T b) {
   return a > b ? a = b, 1 : 0;
 }
 
+// デバッグ出力。LOCAL が定義されているとき（g++ -DLOCAL）だけ「変数名 = 値」を stderr に出す。提出時は何もしない
+// vector / pair / tuple / map / set や、それらの入れ子も中身まで出せる
+//   dump(x, v);  // [L42] x = 3, v = [1, 2, 3]
+#ifdef LOCAL
+template <class T>
+void debug_out(const T &x) {
+  if constexpr (is_convertible_v<const T &, string_view>) {
+    cerr << '"' << x << '"';
+  } else if constexpr (is_same_v<T, i128>) {
+    i128 v = x;
+    if (v < 0) {
+      cerr << '-';
+      v = -v;
+    }
+    string s;
+    do {
+      s += char('0' + (int)(v % 10));
+      v /= 10;
+    } while (v > 0);
+    reverse(s.begin(), s.end());
+    cerr << s;
+  } else if constexpr (is_array_v<T> || requires { x.begin(), x.end(); }) {
+    cerr << '[';
+    bool head = true;
+    for (const auto &e : x) {
+      cerr << (head ? "" : ", ");
+      debug_out(e);
+      head = false;
+    }
+    cerr << ']';
+  } else if constexpr (requires { cerr << x; }) {
+    cerr << x;
+  } else if constexpr (requires { tuple_size<T>::value; }) {
+    cerr << '(';
+    bool head = true;
+    apply([&](const auto &...e) { ((cerr << (head ? "" : ", "), debug_out(e), head = false), ...); }, x);
+    cerr << ')';
+  } else {
+    cerr << '?';
+  }
+}
+
+// "a, f(b, c), v[i]" を引数ごとの名前に分ける（括弧と引用符の中のカンマでは区切らない）
+inline vector<string> debug_split_names(const char *names) {
+  vector<string> res(1);
+  int depth = 0;
+  char quote = 0;
+  for (const char *p = names; *p; ++p) {
+    char c = *p;
+    if (quote) {
+      if (c == '\\' && p[1]) {
+        res.back() += c;
+        c = *++p;
+      } else if (c == quote) {
+        quote = 0;
+      }
+    } else if (c == '"' || c == '\'') {
+      quote = c;
+    } else if (c == '(' || c == '[' || c == '{') {
+      ++depth;
+    } else if (c == ')' || c == ']' || c == '}') {
+      --depth;
+    } else if (c == ',' && depth == 0) {
+      res.emplace_back();
+      continue;
+    }
+    res.back() += c;
+  }
+  for (auto &s : res) {
+    size_t b = s.find_first_not_of(' '), e = s.find_last_not_of(' ');
+    s = b == string::npos ? "" : s.substr(b, e - b + 1);
+  }
+  return res;
+}
+
+template <class... Args>
+void debug_print(int line, const char *names, const Args &...args) {
+  vector<string> name = debug_split_names(names);
+  size_t i = 0;
+  cerr << "[L" << line << "]";
+  ((cerr << (i ? ", " : " ") << (i < name.size() ? name[i] : "?") << " = ", debug_out(args), ++i), ...);
+  cerr << '\n';
+}
+#define dump(...) debug_print(__LINE__, #__VA_ARGS__, __VA_ARGS__)
+#else
+#define dump(...) ((void)0)
+#endif
+
 const int INF = 1e9;
 
 const int dx[] = {-1, 1, 0, 0, 1, 1, -1, -1};
@@ -114,22 +202,23 @@ struct Random {
 int Time_Limit = 1900;
 auto timer = TimeKeeper(Time_Limit);
 
-bool sa_accept(int diff) {
-  // スコアを小さくする場合はdiffの正負を反転させる
-  // diff = -diff;
-  timer.setNowTime();
-  double T0 = 1000;
-  double T1 = 0.01;
-  double e_ms = timer.getNowTime();
-  double progress = min(1.0, max(0.0, e_ms / Time_Limit));
-  // 線形冷却
-  double temp = T0 + (T1 - T0) * progress;
-  // 指数冷却
-  // double temp = T0 * pow(T1 / T0, progress);
-  if (rnd.rand_double() < exp(double(diff) / temp)) {
-    return true;
+// 調整したいパラメータ。環境変数 AHC_<name> があればその値、なければ既定値を返す
+// scripts/tune.py（Optuna）が環境変数で値を渡す。提出時は環境変数がないので既定値になる
+// 既定値の型で読み方が決まるので、小数のパラメータは 1000.0 のように書く
+//
+// 使い方:
+//   double T0 = param("T0", 1000.0);
+//   int BEAM_WIDTH = param("BEAM_WIDTH", 300);
+template <class T>
+T param(const char *name, T default_value) {
+  const char *s = getenv((string("AHC_") + name).c_str());
+  if (s == nullptr) {
+    return default_value;
+  }
+  if constexpr (is_integral_v<T>) {
+    return (T)atoll(s);
   } else {
-    return false;
+    return (T)atof(s);
   }
 }
 
